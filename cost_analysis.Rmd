@@ -1,0 +1,278 @@
+---
+title: "Predicting Tuition Costs"
+author: "Shaun Sandbloom - srs341@georgetown.edu"
+date: "12/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+\begin{center}
+\Huge{PPOL 670 | Assignment 6}
+
+\Huge{Supervised Machine Learning}
+\end{center}
+
+\vspace{0.1in}
+
+<style>
+    pre {
+        border: 0;
+    }
+</style>
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidymodels)
+library(jsonlite)
+library(httr)
+library(rscorecard)
+library(sf)
+library(tigris)
+library(tidycensus)
+library(usmap)
+library(recipes)
+library(rpart)
+```
+
+## Introduction
+
+* The student debt crisis is a frequent topic of discussion in policy environments.
+* There are a wide variety of factors that contribute to the problem.
+* But debt starts with one key factor - **cost**.
+
+
+#### Meaning of Education
+
+* "Education" can mean something different to everyone. 
+* Formal, structured post-secondary education occurs in a variety of formats.
+* What appears to stand out is what it takes to earn a **bachelor's degree** from a **four-year academic program** commonly offered by universities.
+* This analysis explores the characteristics of both **public** and **private (non-profit)** universities that award bachelor's degrees for completing a **four-year** academic program.
+
+## Data Source
+
+#### [The U.S. Department of Education College Scorecard API](https://collegescorecard.ed.gov/data/documentation/)
+
+- Data documentation can be found [here](https://collegescorecard.ed.gov/data/documentation/)
+- The API data dictionary can be found [here](https://collegescorecard.ed.gov/assets/FullDataDocumentation.pdf)
+
+## Extraction, Transformation, and Loading (ETL)
+
+The College Scorecard API uses a parameter-based query structure. Additionally, the API will only return 100 rows of data at a time. This means queries with large-volume requests will need to be iterated over multiple requests and aggregated into a larger data frame.
+
+To simplify queries to the API, I first created a user-defined function to format the desired attributes appropriately for the request URL.
+
+```{r, eval = FALSE}
+query_scorecard <- function(endpoint, filters, fields, per_page, page){
+  api_path <- "https://api.data.gov/ed/collegescorecard/v1/"
+  query <- paste0(
+    api_path, 
+    endpoint,
+    ".json?",
+    filters, 
+    "&fields=", 
+    paste(fields, collapse = ","),
+    "&per_page=",
+    per_page,
+    "&page=",
+    page,
+    "&api_key=", 
+    api_key
+    )
+  print(query)
+  print("Querying...")
+  response <- GET(query)
+  if(http_error(response)) {
+    print("Query failed.")
+    print(http_status(response)$message)
+  } else {
+    print("Query confirmed.")
+    print(paste("Data type:", http_type(response)))
+
+    content <- content(response, as = "text")
+    results <- fromJSON(content)
+    final <- tibble(results$results)
+  }
+}
+```
+
+#### Variables collected
+
+The following data points are the result of pulling data from the **College Scorecard API** from 2000-2019 and extensive transformation. The Department of Education publishes an [Excel spreadsheet](https://collegescorecard.ed.gov/assets/CollegeScorecardDataDictionary.xlsx) with over 2000 variables on academic institutions. 
+
+| Variable | Description |
+| :------- | :---------- |
+| `id` | A school's IPED code |
+| `name` | A school's name |
+| `city` | The city the school is located |
+| `state` | The state the school is located |
+| `ownership` | A value denoting if a school is public or private non-profit |
+| `tuition_type` | Distinguishes between in-state and out-of-state rates |
+| `tuition_rate` | The financial cost of tuition for an academic and/or program year |
+| `location.lat` | A school's latitudinal coordinate |
+| `location.lon` | A school's longitudinal coordinate |
+| `size` | Categorical description of the the school's size |
+| `size_details` | Categorical description of the student body |
+| `locale_type` | Categorical description of the school's geographic setting |
+| `locale_size` | Categorical description of the size of the geographical setting |
+
+## Exploratory Data Analysis (EDA)
+
+#### How have tuition rates evolved over the last 20 years?
+
+```{r, echo = FALSE}
+territories <- c("AS", "FM", "GU", "MH", "MP", "PR", "PR", "PW", "VI")
+
+master_final <- read_csv("data/master_final.csv") %>% 
+  select(-communication:-military) %>% 
+  filter(tuition_rate > 1000,
+         !state %in% territories) %>% 
+  mutate(ownership = as.factor(ownership),
+         size = as.factor(size),
+         size_details = as.factor(size_details),
+         locale_type = as.factor(locale_type),
+         locale_size = as.factor(locale_size),
+         tuition_type = as.factor(tuition_type))
+
+master_final %>% 
+  group_by(year, ownership) %>% 
+  summarize(total = sum(tuition_rate)) %>% 
+  ggplot(aes(x = year, y = total, fill = ownership)) +
+  geom_col(width=.5, position = "dodge") +
+  theme_minimal() +
+  labs(title = "Total Tuition Costs from 2000 to 2019",
+       y = "Costs (in dollars)") +
+  scale_y_continuous(labels = comma)
+```
+
+#### What's meaningful about this view
+
+* Annual tuition costs appear to be steadily rising across both public and private institutions.
+* As a whole, the cost of private higher-education appears to be significantly more expensive.
+
+#### What this view doesn't answer
+* Calculating total costs on an annual basis overlooks the number of schools in each category...
+* Are there simply more private schools than public schools?
+
+```{r, echo = FALSE}
+master_final %>% 
+  group_by(year, ownership) %>% 
+  summarize(total = n()) %>% 
+  ggplot(aes(x = year, y = total, fill = ownership)) +
+  geom_col(width=.5, position = "dodge") +
+  theme_minimal() +
+  labs(title = "Total Number of Schools from 2000 to 2019",
+       y = "# of Schools") +
+  scale_y_continuous(labels = comma)
+```
+
+
+#### Comparing tution rates from state-to-state
+```{r, echo = FALSE}
+territories <- c("AS", "FM", "GU", "MH", "MP", "PR", "PR", "PW", "VI")
+
+pub_rates_in <- master_final %>% 
+  filter(!state %in% territories,
+         year == 2019,
+         ownership == "public",
+         tuition_type == "tuition_in_state") %>% 
+  group_by(state, tuition_type) %>% 
+  summarize(total = mean(tuition_rate))
+
+plot_usmap(data = pub_rates_in, values = "total", color = "white", exclude = "AL") +
+  scale_fill_continuous(low = 'green', 
+                        high = 'red',
+                        label = scales::comma,
+                        limits = c(0,50000),
+                        name = "Dollars ($)") +
+  theme(legend.position = "right") +
+  labs(title = "Average In-State Public Tuition Rates (2019)")
+
+pub_rates_out <- master_final %>% 
+  filter(!state %in% territories,
+         year == 2019,
+         ownership == "public",
+         tuition_type == "tuition_out_state") %>% 
+  group_by(state, tuition_type) %>% 
+  summarize(total = mean(tuition_rate))
+
+plot_usmap(data = pub_rates_out, values = "total", color = "white", exclude = "AL") +
+  scale_fill_continuous(low = 'green', 
+                        high = 'red',
+                        label = scales::comma,
+                        limits = c(0,50000),
+                        name = "Dollars($)") +
+  theme(legend.position = "right") +
+  labs(title = "Average Out-of_State Public Tuition Rates (2019)")
+
+priv_rates <- master_final %>% 
+  filter(!state %in% territories,
+         year == 2019,
+         ownership == "private") %>% 
+  group_by(state) %>% 
+  summarize(total = mean(tuition_rate))
+
+plot_usmap(data = priv_rates, values = "total", color = "white", exclude = c("AK", "WY")) +
+  scale_fill_continuous(low = 'green', 
+                        high = 'red',
+                        label = scales::comma,
+                        limits = c(0,50000),
+                        name = "Dollars ($)") +
+  theme(legend.position = "right") +
+  labs(title = "Average Private Tuition Rates (2019)")
+```
+
+#### Wanna get away?
+
+* There's a clear financial advantage to attending a four-year public institution in your home state.
+* Students who choose to attend an out-of-state public institution might consider nearby private alternatives, **depending on the state**.
+
+### One last exploration into the evolution to tuition costs...
+
+#### Most Expensive and Least Expensive Schools: 2019
+```{r, echo = FALSE}
+master_final %>% 
+  filter(year == 2019) %>% 
+  select(name, city, state, ownership, tuition_rate) %>% 
+  group_by(name, city, state, ownership) %>% 
+  summarize(cost = max(tuition_rate)) %>% 
+  arrange(desc(cost)) %>% 
+  head() %>% 
+  knitr::kable()
+
+master_final %>% 
+  filter(year == 2019) %>% 
+  select(name, city, state, ownership, tuition_rate) %>% 
+  group_by(name, city, state, ownership) %>% 
+  summarize(cost = max(tuition_rate)) %>% 
+  arrange(desc(cost)) %>% 
+  tail() %>% 
+  knitr::kable()
+```
+
+#### Most Expensive and Least Expensive Schools: 2000
+```{r, echo = FALSE}
+master_final %>% 
+  filter(year == 2000) %>% 
+  select(name, city, state, ownership, tuition_rate) %>% 
+  group_by(name, city, state, ownership) %>% 
+  summarize(cost = max(tuition_rate)) %>% 
+  arrange(desc(cost)) %>% 
+  head() %>% 
+  knitr::kable()
+
+master_final %>% 
+  filter(year == 2000) %>% 
+  select(name, city, state, ownership, tuition_rate) %>% 
+  group_by(name, city, state, ownership) %>% 
+  summarize(cost = max(tuition_rate)) %>% 
+  arrange(desc(cost)) %>% 
+  tail() %>% 
+  knitr::kable()
+```
+
+## Continuing the discussion...
+
+Future analyses may offer new insights on these data, by exploring predictive models and evaluating which of the variables above have a significant impact on predicting future tuition costs.
